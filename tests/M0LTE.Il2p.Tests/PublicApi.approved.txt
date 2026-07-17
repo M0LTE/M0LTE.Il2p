@@ -1,0 +1,62 @@
+namespace M0LTE.Il2p
+{
+    public readonly struct Il2pBlockLayout : System.IEquatable<M0LTE.Il2p.Il2pBlockLayout>
+    {
+        public const int MaxBlockDataSize = 239;
+        public const int ParitySymbolsPerBlock = 16;
+        public int BlockCount { get; }
+        public int LargeBlockCount { get; }
+        public int LargeBlockSize { get; }
+        public int PayloadByteCount { get; }
+        public int SmallBlockCount { get; }
+        public int SmallBlockSize { get; }
+        public int WireLength { get; }
+        public static M0LTE.Il2p.Il2pBlockLayout Compute(int payloadByteCount) { }
+    }
+    public static class Il2pCodec
+    {
+        public const int HeaderParitySymbols = 2;
+        public const int HeaderWireLength = 15;
+        public const int MaxPayloadBytes = 1023;
+        public const int SyncWord = 15818312;
+        public const int TrailingCrcWireLength = 4;
+        public static byte[] Encode(System.ReadOnlySpan<byte> ax25Frame, bool appendCrc, bool legacyMaxFecBit = true) { }
+        public static bool TryDecode(System.ReadOnlySpan<byte> il2pWire, bool hasTrailingCrc, out byte[] ax25Frame, out M0LTE.Il2p.Il2pDecodeInfo info) { }
+        public static bool TryDecodeHeader(System.ReadOnlySpan<byte> headerWire, out M0LTE.Il2p.Il2pHeaderType headerType, out int payloadByteCount, out int correctedSymbols) { }
+    }
+    public readonly struct Il2pDecodeInfo : System.IEquatable<M0LTE.Il2p.Il2pDecodeInfo>
+    {
+        public Il2pDecodeInfo(M0LTE.Il2p.Il2pHeaderType HeaderType, int CorrectedSymbols, bool? CrcValid) { }
+        public int CorrectedSymbols { get; init; }
+        public bool? CrcValid { get; init; }
+        public M0LTE.Il2p.Il2pHeaderType HeaderType { get; init; }
+    }
+    public sealed class Il2pDeframer
+    {
+        public Il2pDeframer(System.Action<byte[], M0LTE.Il2p.Il2pDecodeInfo> frameReceived, bool crcMode) { }
+        public Il2pDeframer(System.Action<byte[], M0LTE.Il2p.Il2pDecodeInfo> frameReceived, bool crcMode, int syncWord) { }
+        public long CrcFailures { get; }
+        public long RsFailures { get; }
+        public void PushBit(int bit) { }
+        public void Reset() { }
+    }
+    public static class Il2pFramer
+    {
+        public static byte[] FrameBits(System.ReadOnlySpan<byte> il2pWire, int preambleBits, M0LTE.Il2p.Il2pFramer.PreambleStyle style = 0) { }
+        public enum PreambleStyle
+        {
+            Alternating = 0,
+            Zeros = 1,
+        }
+    }
+    public enum Il2pHeaderType
+    {
+        Type0 = 0,
+        Type1 = 1,
+    }
+    public static class Il2pScrambler
+    {
+        public static void Descramble(System.Span<byte> block) { }
+        public static void Scramble(System.ReadOnlySpan<byte> input, System.Span<byte> output) { }
+    }
+}

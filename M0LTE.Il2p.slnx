@@ -1,0 +1,8 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/M0LTE.Il2p/M0LTE.Il2p.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/M0LTE.Il2p.Tests/M0LTE.Il2p.Tests.csproj" />
+  </Folder>
+</Solution>

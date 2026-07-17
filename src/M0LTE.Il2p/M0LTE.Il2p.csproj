@@ -1,0 +1,24 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <PackageId>M0LTE.Il2p</PackageId>
+    <Title>M0LTE.Il2p — IL2P (Improved Layer 2 Protocol) codec</Title>
+    <Description>A managed IL2P v0.6 codec for .NET: encodes/decodes AX.25 frames to and from the IL2P wire format (Type 0/1 headers, the packet-synchronous scrambler, Reed-Solomon FEC, block segmentation) including the IL2P+CRC extension, plus a streaming bit-level deframer. Dire-Wolf / NinoTNC interoperable. Extracted from the pdn-soundmodem packet-radio modem.</Description>
+    <PackageTags>il2p;ax25;packet-radio;tnc;fec;reed-solomon;amateur-radio;ham-radio;direwolf;ninotnc</PackageTags>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="M0LTE.Fec" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Include="../../README.md" Pack="true" PackagePath="/" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="M0LTE.Il2p.Tests" />
+  </ItemGroup>
+
+</Project>
