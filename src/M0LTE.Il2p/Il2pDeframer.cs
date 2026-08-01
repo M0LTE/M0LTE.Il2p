@@ -10,6 +10,19 @@ namespace M0LTE.Il2p;
 /// AX.25 frame. Bits arrive most-significant-bit first, as IL2P transmits them.
 /// One instance per receive bit stream; not thread-safe.
 /// </summary>
+/// <remarks>
+/// A false sync match (channel garbage can image the sync word, and some modes' idle
+/// garbage is statistically biased toward it) starts a bogus collection of up to a
+/// maximum-size frame — and a REAL sync arriving during that collection would be consumed
+/// as payload. Reed-Solomon and the CRC reject the bogus frame, but rejection alone would
+/// leave the deframer deaf for the collection's duration. This deframer is instead
+/// backtracking: every physical bit also lands in a ring buffer, and when a collection
+/// fails (header RS, length, body RS) the read cursor rewinds to one bit past the failed
+/// sync and re-hunts — bit-for-bit equivalent to never having locked at all, so a frame
+/// inside a failed collection is always recovered. Collection start positions advance
+/// strictly monotonically, so processing always terminates; the ring covers a
+/// maximum-size collection plus the sync, so a rewind can never underrun.
+/// </remarks>
 public sealed class Il2pDeframer
 {
     private enum State
@@ -19,10 +32,14 @@ public sealed class Il2pDeframer
         CollectingBody,
     }
 
+    // Power of two, > max collection bits (header + max body + CRC ≈ 8.5k) + sync slack.
+    private const int RingSize = 16384;
+
     private readonly bool _crcMode;
     private readonly int _syncWord;
     private readonly Action<byte[], Il2pDecodeInfo> _frameReceived;
     private readonly byte[] _buffer;
+    private readonly byte[] _ring = new byte[RingSize];
 
     private State _state = State.Hunting;
     private int _syncShift;
@@ -31,6 +48,10 @@ public sealed class Il2pDeframer
     private int _length;
     private int _expectedLength;
     private int _invert;
+    private long _writePos;
+    private long _readPos;
+    private long _syncEndPos;
+    private int _huntWarmup = 23;
 
     /// <summary>Creates a deframer delivering decoded AX.25 frames to
     /// <paramref name="frameReceived"/>.</summary>
@@ -68,11 +89,34 @@ public sealed class Il2pDeframer
     /// <summary>Pushes one received bit (0/1) through the deframer.</summary>
     public void PushBit(int bit)
     {
-        bit &= 1;
+        _ring[(int)(_writePos & (RingSize - 1))] = (byte)(bit & 1);
+        _writePos++;
+        while (_readPos < _writePos)
+        {
+            // Consume-then-step: a Backtrack inside Step rewrites _readPos wholesale, and
+            // the next iteration picks up exactly at the rewound position.
+            int next = _ring[(int)(_readPos & (RingSize - 1))];
+            _readPos++;
+            Step(next);
+        }
+    }
 
+    private void Step(int bit)
+    {
         if (_state == State.Hunting)
         {
             _syncShift = ((_syncShift << 1) | bit) & 0xFFFFFF;
+
+            // No match until the register holds 24 real bits (23 skips — the first full
+            // window completes on the 24th): a partially-refilled register's leading
+            // zeros can otherwise count as the one tolerated error and re-match the very
+            // sync a Backtrack just failed — collection start would stop advancing and
+            // the rewind loop would never terminate.
+            if (_huntWarmup > 0)
+            {
+                _huntWarmup--;
+                return;
+            }
             // Hunt the sync word and its complement: the spec's FSK symbol maps note some
             // radios invert the signal and recommend checking for inverted data. A
             // complemented match latches inversion for the rest of that frame.
@@ -86,6 +130,7 @@ public sealed class Il2pDeframer
                 _byteShift = 0;
                 _bitCount = 0;
                 _length = 0;
+                _syncEndPos = _readPos - 1; // the bit just consumed is the sync's last
             }
 
             return;
@@ -113,7 +158,7 @@ public sealed class Il2pDeframer
                     _buffer.AsSpan(0, Il2pCodec.HeaderWireLength), out _, out int payloadByteCount, out _))
             {
                 RsFailures++;
-                ReturnToHunt();
+                Backtrack();
                 return;
             }
 
@@ -142,28 +187,51 @@ public sealed class Il2pDeframer
                 _buffer.AsSpan(0, _length), _crcMode, out byte[] frame, out var info))
         {
             RsFailures++;
+            Backtrack();
+            return;
         }
-        else if (info.CrcValid == false)
+
+        if (info.CrcValid == false)
         {
             CrcFailures++;
-        }
-        else
-        {
-            _frameReceived(frame, info);
+            Backtrack();
+            return;
         }
 
-        ReturnToHunt();
+        _frameReceived(frame, info);
+        _state = State.Hunting;
+        _syncShift = 0;
+        _huntWarmup = 23;
     }
 
-    private void ReturnToHunt()
+    /// <summary>
+    /// A collection failed: rewind to re-hunt from one bit past the start of the sync that
+    /// began it. The 23 bits before that point re-prime the hunter's shift register, so the
+    /// first new match candidate ends exactly one bit after the failed one — overlapping
+    /// syncs are never skipped. The failure's own bits are reconsidered in full, which is
+    /// what recovers a real frame swallowed by a bogus collection. The Step/rewind loop in
+    /// <see cref="PushBit"/> terminates because each collection starts strictly after the
+    /// previous failed one.
+    /// </summary>
+    private void Backtrack()
     {
         _state = State.Hunting;
         _syncShift = 0;
+        _huntWarmup = 23;
+        long resume = _syncEndPos - 22;
+        long floor = _writePos - RingSize;
+        _readPos = resume > floor ? resume : (floor > 0 ? floor : 0);
     }
 
     /// <summary>Abandons any frame in progress and returns to hunting for a sync word. For
     /// receive paths with hard stream boundaries (e.g. one IL2P stream per FreeDV burst):
     /// without a reset, a frame truncated by the end of one stream would silently consume
-    /// the head of the next as its missing body.</summary>
-    public void Reset() => ReturnToHunt();
+    /// the head of the next as its missing body. The bit backlog is discarded with it.</summary>
+    public void Reset()
+    {
+        _state = State.Hunting;
+        _syncShift = 0;
+        _huntWarmup = 23;
+        _readPos = _writePos;
+    }
 }
