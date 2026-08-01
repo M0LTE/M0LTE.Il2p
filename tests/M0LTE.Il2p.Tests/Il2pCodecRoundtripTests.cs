@@ -221,6 +221,80 @@ public class Il2pCodecRoundtripTests
         return new string([.. Enumerable.Range(0, length).Select(_ => alphabet[random.Next(alphabet.Length)])]);
     }
 
+    [Theory]
+    [InlineData(0, 0)]
+    [InlineData(1, 1)]
+    public void Equal_C_Bits_With_Crc_Fall_Back_To_Type0_And_Roundtrip(int destC, int srcC)
+    {
+        // The trailing CRC is computed over the original frame but checked against the
+        // receiver's reconstruction, so the lossy equal-C Type 1 mapping would fail it on
+        // every such frame (NinoTNC il2p_crc semantics then drop the frame). Under CRC the
+        // encoder must take Type 0, which reproduces the frame byte-exactly.
+        byte[] frame =
+        [
+            .. Address("QST", 0, last: false, cBit: destC),
+            .. Address("M0LTE", 1, last: true, cBit: srcC),
+            0x03, 0xF0, (byte)'h', (byte)'i',
+        ];
+
+        byte[] wire = Il2pCodec.Encode(frame, appendCrc: true);
+        bool ok = Il2pCodec.TryDecode(wire, hasTrailingCrc: true, out byte[] decoded, out var info);
+
+        ok.Should().BeTrue();
+        decoded.Should().Equal(frame);
+        info.HeaderType.Should().Be(Il2pHeaderType.Type0);
+        info.CrcValid.Should().BeTrue();
+    }
+
+    [Fact]
+    public void Proper_Command_Response_Frames_With_Crc_Stay_Type1()
+    {
+        foreach ((int destC, int srcC) in new[] { (1, 0), (0, 1) })
+        {
+            byte[] frame =
+            [
+                .. Address("QST", 0, last: false, cBit: destC),
+                .. Address("M0LTE", 1, last: true, cBit: srcC),
+                0x03, 0xF0, (byte)'h', (byte)'i',
+            ];
+
+            byte[] wire = Il2pCodec.Encode(frame, appendCrc: true);
+            bool ok = Il2pCodec.TryDecode(wire, hasTrailingCrc: true, out byte[] decoded, out var info);
+
+            ok.Should().BeTrue($"C bits {destC}/{srcC}");
+            decoded.Should().Equal(frame, $"C bits {destC}/{srcC}");
+            info.HeaderType.Should().Be(Il2pHeaderType.Type1, $"C bits {destC}/{srcC}");
+            info.CrcValid.Should().BeTrue($"C bits {destC}/{srcC}");
+        }
+    }
+
+    [Fact]
+    public void Lossy_Layer3_Pid_With_Crc_Falls_Back_To_Type0()
+    {
+        // The layer-3 PID group canonicalises to 0x20 on decode: 0x10 is lossy (must
+        // fall back under CRC), 0x20 is its own canonical form (Type 1 stays exact).
+        static byte[] IFrame(byte pid) =>
+        [
+            .. Address("QST", 0, last: false, cBit: 1),
+            .. Address("M0LTE", 1, last: true, cBit: 0),
+            0x00, pid, (byte)'h', (byte)'i',
+        ];
+
+        byte[] lossyWire = Il2pCodec.Encode(IFrame(0x10), appendCrc: true);
+        Il2pCodec.TryDecode(lossyWire, hasTrailingCrc: true, out byte[] lossyDecoded, out var lossyInfo)
+            .Should().BeTrue();
+        lossyDecoded.Should().Equal(IFrame(0x10));
+        lossyInfo.HeaderType.Should().Be(Il2pHeaderType.Type0);
+        lossyInfo.CrcValid.Should().BeTrue();
+
+        byte[] exactWire = Il2pCodec.Encode(IFrame(0x20), appendCrc: true);
+        Il2pCodec.TryDecode(exactWire, hasTrailingCrc: true, out byte[] exactDecoded, out var exactInfo)
+            .Should().BeTrue();
+        exactDecoded.Should().Equal(IFrame(0x20));
+        exactInfo.HeaderType.Should().Be(Il2pHeaderType.Type1);
+        exactInfo.CrcValid.Should().BeTrue();
+    }
+
     private static byte[] Address(string callsign, int ssid, bool last, int cBit)
     {
         var bytes = new byte[7];
