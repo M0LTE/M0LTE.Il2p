@@ -70,7 +70,8 @@ public static class Il2pCodec
 
         Span<byte> header = stackalloc byte[Il2pHeaderCodec.HeaderLength];
         ReadOnlySpan<byte> payload;
-        if (Il2pHeaderCodec.TryEncodeType1(ax25Frame, header, legacyMaxFecBit, out int payloadOffset))
+        if (Il2pHeaderCodec.TryEncodeType1(ax25Frame, header, legacyMaxFecBit, out int payloadOffset)
+            && (!appendCrc || Type1RoundTripsExactly(header, ax25Frame[..payloadOffset])))
         {
             payload = ax25Frame[payloadOffset..];
         }
@@ -121,6 +122,20 @@ public static class Il2pCodec
 
         return output;
     }
+
+    // The Type 1 translation is lossy: IL2P carries a single C bit (the degenerate AX.25
+    // equal-C-bit forms decode as the complementary v2.2 pair) and canonicalises the
+    // layer-3 PID group to 0x20. Harmless on a plain IL2P link — but the trailing CRC is
+    // computed here over the ORIGINAL frame while the receiver checks it against its
+    // RECONSTRUCTION, so any lossy translation makes every such frame fail the CRC and
+    // (under NinoTNC il2p_crc semantics) be dropped. When the CRC rides along, only a
+    // byte-exact header roundtrip may use Type 1; everything else falls back to Type 0
+    // transparent encapsulation, which reproduces the frame byte-for-byte under either
+    // convention. (A NinoTNC transmits Type 0 throughout, so this also matches the
+    // interop ground truth for the frames it can send.)
+    private static bool Type1RoundTripsExactly(ReadOnlySpan<byte> header, ReadOnlySpan<byte> ax25Header) =>
+        Il2pHeaderCodec.TryDecodeType1(header, out byte[] roundTripped)
+        && ax25Header.SequenceEqual(roundTripped);
 
     /// <summary>
     /// Decodes the 15 header wire bytes that follow a sync word, yielding the header type
