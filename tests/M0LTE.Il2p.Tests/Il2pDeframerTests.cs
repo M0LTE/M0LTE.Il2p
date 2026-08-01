@@ -108,7 +108,9 @@ public class Il2pDeframerTests
         }
 
         received.Should().BeEmpty();
-        deframer.RsFailures.Should().Be(1);
+        // At least one: the backtracking re-hunt may find further near-sync images inside
+        // the corrupted bits and legitimately count their failed collections too.
+        deframer.RsFailures.Should().BeGreaterThanOrEqualTo(1);
     }
 
     [Fact]
@@ -123,5 +125,107 @@ public class Il2pDeframerTests
         }
 
         received.Should().BeEmpty();
+    }
+
+    [Fact]
+    public void A_Frame_Inside_A_Failed_Garbage_Collection_Is_Recovered()
+    {
+        // A false sync followed by garbage starts a bogus header collection; the real
+        // frame's own sync lands inside those 15 bytes. A non-backtracking deframer
+        // consumes the real sync as bogus header bytes and loses the frame.
+        byte[] ax25 = Convert.FromHexString("968264888AAEE4969668908A946F81");
+        byte[] wire = Il2pCodec.Encode(ax25, appendCrc: true);
+
+        var received = new List<byte[]>();
+        var deframer = new Il2pDeframer((frame, _) => received.Add(frame), crcMode: true);
+
+        // Self-calibrating garbage: the bogus header the deframer will assemble is the 5
+        // garbage bytes + the 3 real sync bytes + the first 7 wire bytes. Pick a first
+        // garbage byte that makes that 15-byte header fail RS, so the bogus collection is
+        // guaranteed to fail (a header that happened to pass would stall in body
+        // collection instead, which is a different scenario, covered separately).
+        byte[] syncBytes = [0xF1, 0x5E, 0x48];
+        byte[] garbageHeaderStart = [0x00, 0x00, 0xAA, 0x55, 0xF0];
+        for (int candidate = 0; candidate < 256; candidate++)
+        {
+            garbageHeaderStart[0] = (byte)candidate;
+            byte[] bogus = [.. garbageHeaderStart, .. syncBytes, .. wire[..7]];
+            if (!Il2pCodec.TryDecodeHeader(bogus, out _, out _, out _))
+            {
+                break;
+            }
+        }
+
+        foreach (int bit in SyncBits()
+                     .Concat(ToBits(garbageHeaderStart))
+                     .Concat(SyncBits())
+                     .Concat(ToBits(wire)))
+        {
+            deframer.PushBit(bit);
+        }
+
+        received.Should().ContainSingle().Which.Should().Equal(ax25);
+    }
+
+    [Fact]
+    public void A_Frame_Inside_A_Header_Passing_Garbage_Body_Is_Recovered()
+    {
+        // Worse case: the bogus collection's header passes RS (here: a REAL header for a
+        // large frame, truncated), committing the deframer to collect a large body — and
+        // the real frame transmits entirely inside that span. Backtracking recovers it
+        // after the bogus body fails RS.
+        byte[] bigFrame = new byte[300];
+        Convert.FromHexString("968264888AAEE4969668908A946F81").CopyTo(bigFrame, 0);
+        byte[] bigWire = Il2pCodec.Encode(bigFrame, appendCrc: true);
+
+        byte[] ax25 = Convert.FromHexString("86A24040404060969668908A94E103F0");
+        byte[] wire = Il2pCodec.Encode(ax25, appendCrc: true);
+
+        var received = new List<byte[]>();
+        var deframer = new Il2pDeframer((frame, _) => received.Add(frame), crcMode: true);
+        // Enough filler that the bogus collection COMPLETES (its expected length is the
+        // big frame's full wire size) and fails body RS — only then does the deframer
+        // backtrack and recover the real frame from inside the failed span.
+        int bogusExpected = bigWire.Length;
+        int fedInsideBogus = 40 + 3 + wire.Length; // truncated body + real sync + real frame
+        int fillerBytes = bogusExpected - Il2pCodec.HeaderWireLength - fedInsideBogus + 8;
+        foreach (int bit in SyncBits()
+                     .Concat(ToBits(bigWire.AsSpan(0, Il2pCodec.HeaderWireLength + 40).ToArray()))
+                     .Concat(SyncBits())
+                     .Concat(ToBits(wire))
+                     .Concat(ToBits(new byte[fillerBytes])))
+        {
+            deframer.PushBit(bit);
+        }
+
+        received.Should().ContainSingle().Which.Should().Equal(ax25);
+        deframer.RsFailures.Should().BeGreaterThan(0);
+    }
+
+    [Fact]
+    public void A_Frame_After_Ones_Biased_Garbage_Decodes()
+    {
+        // Idle-channel garbage from a railed 4-level slicer is ~75% ones, and the C4FSK
+        // sync is 18/24 ones — false near-syncs are dense, so a gate-less receiver leans
+        // entirely on backtracking to stay live. No false frames may emerge either.
+        var random = new Random(20260801);
+        byte[] ax25 = Convert.FromHexString("968264888AAEE4969668908A946F81");
+        byte[] wire = Il2pCodec.Encode(ax25, appendCrc: true);
+        int c4Sync = 0x57DF7F;
+
+        var received = new List<byte[]>();
+        var deframer = new Il2pDeframer((frame, _) => received.Add(frame), crcMode: true, syncWord: c4Sync);
+        for (int i = 0; i < 100_000; i++)
+        {
+            deframer.PushBit(random.NextDouble() < 0.75 ? 1 : 0);
+        }
+
+        foreach (int bit in Enumerable.Range(0, 24).Select(i => (c4Sync >> (23 - i)) & 1)
+                     .Concat(ToBits(wire)))
+        {
+            deframer.PushBit(bit);
+        }
+
+        received.Should().ContainSingle().Which.Should().Equal(ax25);
     }
 }
