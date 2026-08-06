@@ -2,7 +2,8 @@ using M0LTE.Fec;
 
 namespace M0LTE.Il2p;
 
-/// <summary>Outcome details for a successful <see cref="Il2pCodec.TryDecode"/>.</summary>
+/// <summary>Outcome details for a successful
+/// <see cref="Il2pCodec.TryDecode(ReadOnlySpan{byte}, bool, out byte[], out Il2pDecodeInfo)"/>.</summary>
 /// <param name="HeaderType">Which IL2P header mapping the frame used.</param>
 /// <param name="CorrectedSymbols">Total bytes repaired by Reed-Solomon FEC across the
 /// header and all payload blocks (0 for a clean frame).</param>
@@ -10,8 +11,13 @@ namespace M0LTE.Il2p;
 /// CRC was present, null when decoding without one. A false value means RS decoding
 /// "succeeded" but produced a frame whose CRC disagrees — the caller decides whether to
 /// enforce (NinoTNC il2p_crc bit-1 semantics).</param>
+/// <param name="ErasedSymbols">Bytes the decode flagged as erasures from the caller's
+/// confidence hints before Reed-Solomon repaired the frame - non-zero only on the
+/// confidence-aware path, and only when errors-only decoding had already failed. A frame
+/// recovered this way leaned on receiver confidence as well as parity; the count is the
+/// honest measure of how hard.</param>
 public readonly record struct Il2pDecodeInfo(
-    Il2pHeaderType HeaderType, int CorrectedSymbols, bool? CrcValid);
+    Il2pHeaderType HeaderType, int CorrectedSymbols, bool? CrcValid, int ErasedSymbols = 0);
 
 /// <summary>
 /// Whole-frame IL2P encoder/decoder (spec draft v0.6), covering both header types, the
@@ -147,10 +153,33 @@ public static class Il2pCodec
     public static bool TryDecodeHeader(
         ReadOnlySpan<byte> headerWire, out Il2pHeaderType headerType, out int payloadByteCount,
         out int correctedSymbols)
+        => TryDecodeHeader(headerWire, [], out headerType, out payloadByteCount, out correctedSymbols, out _);
+
+    /// <summary>
+    /// <see cref="TryDecodeHeader(ReadOnlySpan{byte}, out Il2pHeaderType, out int, out int)"/>
+    /// with per-byte receiver confidence: when errors-only decoding fails, the weakest wire
+    /// bytes are retried as Reed-Solomon erasures (see the confidence-aware
+    /// <see cref="TryDecode(ReadOnlySpan{byte}, bool, ReadOnlySpan{float}, out byte[], out Il2pDecodeInfo)"/>
+    /// for the contract). The header's 2-parity code corrects one unlocated error; with the
+    /// two damaged bytes flagged it corrects both, which decides whether a short frame is
+    /// collected at all.
+    /// </summary>
+    /// <param name="headerWire">The 15 header wire bytes following the sync word.</param>
+    /// <param name="confidence">Per-byte confidence aligned to <paramref name="headerWire"/>
+    /// (lower = less reliable), or empty for hard-decision decoding.</param>
+    /// <param name="headerType">Which IL2P header mapping the frame uses.</param>
+    /// <param name="payloadByteCount">Payload bytes the header says follow.</param>
+    /// <param name="correctedSymbols">Bytes Reed-Solomon repaired in the header block.</param>
+    /// <param name="erasedSymbols">Bytes erased from the confidence hints to get there.</param>
+    public static bool TryDecodeHeader(
+        ReadOnlySpan<byte> headerWire, ReadOnlySpan<float> confidence,
+        out Il2pHeaderType headerType, out int payloadByteCount,
+        out int correctedSymbols, out int erasedSymbols)
     {
         headerType = Il2pHeaderType.Type0;
         payloadByteCount = 0;
         correctedSymbols = 0;
+        erasedSymbols = 0;
         if (headerWire.Length < HeaderWireLength)
         {
             return false;
@@ -158,7 +187,10 @@ public static class Il2pCodec
 
         Span<byte> block = stackalloc byte[HeaderWireLength];
         headerWire[..HeaderWireLength].CopyTo(block);
-        int corrected = HeaderRs.Decode(block);
+        int corrected = DecodeBlock(
+            HeaderRs, block, headerWire[..HeaderWireLength],
+            confidence.IsEmpty ? [] : confidence[..HeaderWireLength], HeaderErasureLadder,
+            out int erased);
         if (corrected < 0)
         {
             return false;
@@ -169,6 +201,7 @@ public static class Il2pCodec
         headerType = Il2pHeaderCodec.GetHeaderType(header);
         payloadByteCount = Il2pHeaderCodec.GetPayloadByteCount(header);
         correctedSymbols = corrected;
+        erasedSymbols = erased;
         return true;
     }
 
@@ -186,18 +219,45 @@ public static class Il2pCodec
     /// payload count, or the header fields are not those of a conforming encoder.</returns>
     public static bool TryDecode(
         ReadOnlySpan<byte> il2pWire, bool hasTrailingCrc, out byte[] ax25Frame, out Il2pDecodeInfo info)
+        => TryDecode(il2pWire, hasTrailingCrc, [], out ax25Frame, out info);
+
+    /// <summary>
+    /// <see cref="TryDecode(ReadOnlySpan{byte}, bool, out byte[], out Il2pDecodeInfo)"/> with
+    /// per-byte receiver confidence: whenever a block fails errors-only Reed-Solomon
+    /// decoding, its weakest bytes are retried as erasures. Each erasure costs one parity
+    /// symbol where an unlocated error costs two, so a block whose damage the confidence
+    /// flags actually cover corrects up to twice as many bytes - the difference between
+    /// losing and keeping a frame that took a fade through one block. The retry ladder tries
+    /// progressively fewer erasures (leaving tolerance for damage the flags missed), and
+    /// every attempt is still bound by the code's own re-syndrome check; on an IL2P+CRC link
+    /// the trailing CRC remains the end-to-end arbiter of the whole frame.
+    /// </summary>
+    /// <param name="il2pWire">Header, payload blocks and optional CRC trailer, as received.</param>
+    /// <param name="hasTrailingCrc">Whether the link uses IL2P+CRC.</param>
+    /// <param name="byteConfidence">Per-byte confidence aligned to <paramref name="il2pWire"/>
+    /// (lower = less reliable; the scale is the caller's, only the ordering matters), or
+    /// empty for hard-decision decoding.</param>
+    /// <param name="ax25Frame">The reconstructed AX.25 frame (no flags, no FCS).</param>
+    /// <param name="info">Decode diagnostics, including how many bytes were erased.</param>
+    public static bool TryDecode(
+        ReadOnlySpan<byte> il2pWire, bool hasTrailingCrc, ReadOnlySpan<float> byteConfidence,
+        out byte[] ax25Frame, out Il2pDecodeInfo info)
     {
         ax25Frame = [];
         info = default;
 
-        if (il2pWire.Length < HeaderWireLength)
+        if (il2pWire.Length < HeaderWireLength
+            || (!byteConfidence.IsEmpty && byteConfidence.Length != il2pWire.Length))
         {
             return false;
         }
 
         Span<byte> headerBlock = stackalloc byte[HeaderWireLength];
         il2pWire[..HeaderWireLength].CopyTo(headerBlock);
-        int corrected = HeaderRs.Decode(headerBlock);
+        int corrected = DecodeBlock(
+            HeaderRs, headerBlock, il2pWire[..HeaderWireLength],
+            byteConfidence.IsEmpty ? [] : byteConfidence[..HeaderWireLength],
+            HeaderErasureLadder, out int erased);
         if (corrected < 0)
         {
             return false;
@@ -226,13 +286,17 @@ public static class Il2pCodec
             int wireSize = size + Il2pBlockLayout.ParitySymbolsPerBlock;
             var codeword = blockBuffer[..wireSize];
             il2pWire.Slice(inPos, wireSize).CopyTo(codeword);
-            int blockCorrected = PayloadRs.Decode(codeword);
+            int blockCorrected = DecodeBlock(
+                PayloadRs, codeword, il2pWire.Slice(inPos, wireSize),
+                byteConfidence.IsEmpty ? [] : byteConfidence.Slice(inPos, wireSize),
+                PayloadErasureLadder, out int blockErased);
             if (blockCorrected < 0)
             {
                 return false;
             }
 
             corrected += blockCorrected;
+            erased += blockErased;
             Il2pScrambler.Descramble(codeword[..size]);
             codeword[..size].CopyTo(payload.AsSpan(outPos));
             inPos += wireSize;
@@ -273,7 +337,90 @@ public static class Il2pCodec
             crcValid = received == Crc16X25.Compute(ax25Frame);
         }
 
-        info = new Il2pDecodeInfo(headerType, corrected, crcValid);
+        info = new Il2pDecodeInfo(headerType, corrected, crcValid, erased);
         return true;
+    }
+
+    /// <summary>
+    /// (Erasures, additional-error cap) pairs tried, in order, when a payload block fails
+    /// errors-only decoding. Every rung satisfies erasures + 2·cap = 14, two parity symbols
+    /// short of the code's 16: an attempt that spent the whole budget would have no residual
+    /// syndromes to check itself against (with all sixteen erased it is pure interpolation
+    /// and always "succeeds"), while two in reserve put a wrong rung's false-accept near a
+    /// 16-bit CRC's. Descending erasures: the first rungs trust the confidence ranking
+    /// most; the later ones trade flagged coverage for tolerance of damage the flags
+    /// missed. Seven cheap attempts, and only for a block that was headed for the bin.
+    /// </summary>
+    private static readonly (int Erasures, int MaxErrors)[] PayloadErasureLadder =
+        [(14, 0), (12, 1), (10, 2), (8, 3), (6, 4), (4, 5), (2, 6)];
+
+    /// <summary>
+    /// The header's 2-parity code affords no speculative erasures at all: any rung would
+    /// spend both parity symbols and accept whatever interpolation produced - a hallucinated
+    /// header that sizes a bogus collection. Erasure rescue is a payload-block tool; a
+    /// damaged header's remaining hope is bit-level chase decoding arbitrated by the
+    /// trailing CRC, which is future work (pdn-soundmodem docs/rx-roadmap.md workstream 1).
+    /// </summary>
+    private static readonly (int Erasures, int MaxErrors)[] HeaderErasureLadder = [];
+
+    /// <summary>
+    /// Decodes one Reed-Solomon block: errors-only first and, when that fails and the
+    /// caller supplied confidence, retrying from <paramref name="original"/> with the
+    /// weakest bytes erased, down the <paramref name="ladder"/>. <paramref name="working"/>
+    /// holds the decoded block on success.
+    /// </summary>
+    /// <returns>Corrected byte count, or -1 when every attempt fails.</returns>
+    private static int DecodeBlock(
+        ReedSolomon rs, Span<byte> working, ReadOnlySpan<byte> original,
+        ReadOnlySpan<float> confidence, (int Erasures, int MaxErrors)[] ladder, out int erased)
+    {
+        erased = 0;
+        int corrected = rs.Decode(working);
+        if (corrected >= 0 || confidence.IsEmpty)
+        {
+            return corrected;
+        }
+
+        Span<int> weakest = stackalloc int[Il2pBlockLayout.ParitySymbolsPerBlock];
+        foreach ((int erasureCount, int maxErrors) in ladder)
+        {
+            if (erasureCount > original.Length)
+            {
+                continue;
+            }
+
+            // Partial selection sort for the erasureCount lowest-confidence indices - the
+            // block already failed, so this is a salvage path, not a hot one.
+            Span<int> picks = weakest[..erasureCount];
+            for (int k = 0; k < erasureCount; k++)
+            {
+                int best = -1;
+                for (int i = 0; i < original.Length; i++)
+                {
+                    if (picks[..k].Contains(i))
+                    {
+                        continue;
+                    }
+
+                    if (best < 0 || confidence[i] < confidence[best])
+                    {
+                        best = i;
+                    }
+                }
+
+                picks[k] = best;
+            }
+
+            original.CopyTo(working);
+            corrected = rs.Decode(working, picks, maxErrors);
+            if (corrected >= 0)
+            {
+                erased = erasureCount;
+                return corrected;
+            }
+        }
+
+        original.CopyTo(working);
+        return -1;
     }
 }

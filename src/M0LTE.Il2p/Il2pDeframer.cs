@@ -39,7 +39,9 @@ public sealed class Il2pDeframer
     private readonly int _syncWord;
     private readonly Action<byte[], Il2pDecodeInfo> _frameReceived;
     private readonly byte[] _buffer;
+    private readonly float[] _bufferConfidence;
     private readonly byte[] _ring = new byte[RingSize];
+    private readonly float[] _confidenceRing = new float[RingSize];
 
     private State _state = State.Hunting;
     private int _syncShift;
@@ -52,10 +54,12 @@ public sealed class Il2pDeframer
     private long _readPos;
     private long _syncEndPos;
     private int _huntWarmup = 23;
+    private float _byteMinConfidence = float.MaxValue;
+    private bool _confidenceSeen;
 
     /// <summary>Creates a deframer delivering decoded AX.25 frames to
     /// <paramref name="frameReceived"/>.</summary>
-    /// <param name="frameReceived">Called synchronously from <see cref="PushBit"/> with the
+    /// <param name="frameReceived">Called synchronously from <see cref="PushBit(int, float)"/> with the
     /// AX.25 frame and decode diagnostics for every frame that decodes.</param>
     /// <param name="crcMode">True when the link uses IL2P+CRC (both stations must agree).
     /// CRC-invalid frames are dropped and counted, per NinoTNC "check CRC" semantics.</param>
@@ -78,6 +82,7 @@ public sealed class Il2pDeframer
         int maxBody = Il2pBlockLayout.Compute(Il2pCodec.MaxPayloadBytes).WireLength
             + Il2pCodec.TrailingCrcWireLength;
         _buffer = new byte[Il2pCodec.HeaderWireLength + maxBody];
+        _bufferConfidence = new float[_buffer.Length];
     }
 
     /// <summary>Frames that failed Reed-Solomon decoding after a sync match (diagnostics).</summary>
@@ -87,21 +92,34 @@ public sealed class Il2pDeframer
     public long CrcFailures { get; private set; }
 
     /// <summary>Pushes one received bit (0/1) through the deframer.</summary>
-    public void PushBit(int bit)
+    public void PushBit(int bit) => PushBit(bit, 1f);
+
+    /// <summary>
+    /// Pushes one received bit with the demodulator's confidence in it (lower = less
+    /// reliable; the scale is the caller's, only the ordering matters). Confidence buys
+    /// nothing while a frame decodes on parity alone; when a Reed-Solomon block fails, the
+    /// weakest bytes are retried as erasures - see the confidence-aware
+    /// <see cref="Il2pCodec.TryDecode(ReadOnlySpan{byte}, bool, ReadOnlySpan{float}, out byte[], out Il2pDecodeInfo)"/>.
+    /// A byte's confidence is the minimum of its bits' - a byte is wrong if any bit is.
+    /// </summary>
+    public void PushBit(int bit, float confidence)
     {
+        _confidenceSeen |= confidence < 1f;
         _ring[(int)(_writePos & (RingSize - 1))] = (byte)(bit & 1);
+        _confidenceRing[(int)(_writePos & (RingSize - 1))] = confidence;
         _writePos++;
         while (_readPos < _writePos)
         {
             // Consume-then-step: a Backtrack inside Step rewrites _readPos wholesale, and
             // the next iteration picks up exactly at the rewound position.
             int next = _ring[(int)(_readPos & (RingSize - 1))];
+            float nextConfidence = _confidenceRing[(int)(_readPos & (RingSize - 1))];
             _readPos++;
-            Step(next);
+            Step(next, nextConfidence);
         }
     }
 
-    private void Step(int bit)
+    private void Step(int bit, float confidence)
     {
         if (_state == State.Hunting)
         {
@@ -130,6 +148,7 @@ public sealed class Il2pDeframer
                 _byteShift = 0;
                 _bitCount = 0;
                 _length = 0;
+                _byteMinConfidence = float.MaxValue;
                 _syncEndPos = _readPos - 1; // the bit just consumed is the sync's last
             }
 
@@ -138,12 +157,19 @@ public sealed class Il2pDeframer
 
         bit ^= _invert;
         _byteShift = (_byteShift << 1) | bit; // MSB first
+        if (confidence < _byteMinConfidence)
+        {
+            _byteMinConfidence = confidence;
+        }
+
         if (++_bitCount < 8)
         {
             return;
         }
 
         _bitCount = 0;
+        _bufferConfidence[_length] = _byteMinConfidence;
+        _byteMinConfidence = float.MaxValue;
         _buffer[_length++] = (byte)_byteShift;
         _byteShift = 0;
 
@@ -155,7 +181,9 @@ public sealed class Il2pDeframer
             }
 
             if (!Il2pCodec.TryDecodeHeader(
-                    _buffer.AsSpan(0, Il2pCodec.HeaderWireLength), out _, out int payloadByteCount, out _))
+                    _buffer.AsSpan(0, Il2pCodec.HeaderWireLength),
+                    _confidenceSeen ? _bufferConfidence.AsSpan(0, Il2pCodec.HeaderWireLength) : [],
+                    out _, out int payloadByteCount, out _, out _))
             {
                 RsFailures++;
                 Backtrack();
@@ -184,7 +212,9 @@ public sealed class Il2pDeframer
     private void Complete()
     {
         if (!Il2pCodec.TryDecode(
-                _buffer.AsSpan(0, _length), _crcMode, out byte[] frame, out var info))
+                _buffer.AsSpan(0, _length), _crcMode,
+                _confidenceSeen ? _bufferConfidence.AsSpan(0, _length) : [],
+                out byte[] frame, out var info))
         {
             RsFailures++;
             Backtrack();
@@ -210,7 +240,7 @@ public sealed class Il2pDeframer
     /// first new match candidate ends exactly one bit after the failed one — overlapping
     /// syncs are never skipped. The failure's own bits are reconsidered in full, which is
     /// what recovers a real frame swallowed by a bogus collection. The Step/rewind loop in
-    /// <see cref="PushBit"/> terminates because each collection starts strictly after the
+    /// <see cref="PushBit(int, float)"/> terminates because each collection starts strictly after the
     /// previous failed one.
     /// </summary>
     private void Backtrack()

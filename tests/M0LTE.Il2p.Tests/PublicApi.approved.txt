@@ -22,13 +22,16 @@ namespace M0LTE.Il2p
         public const int TrailingCrcWireLength = 4;
         public static byte[] Encode(System.ReadOnlySpan<byte> ax25Frame, bool appendCrc, bool legacyMaxFecBit = true) { }
         public static bool TryDecode(System.ReadOnlySpan<byte> il2pWire, bool hasTrailingCrc, out byte[] ax25Frame, out M0LTE.Il2p.Il2pDecodeInfo info) { }
+        public static bool TryDecode(System.ReadOnlySpan<byte> il2pWire, bool hasTrailingCrc, System.ReadOnlySpan<float> byteConfidence, out byte[] ax25Frame, out M0LTE.Il2p.Il2pDecodeInfo info) { }
         public static bool TryDecodeHeader(System.ReadOnlySpan<byte> headerWire, out M0LTE.Il2p.Il2pHeaderType headerType, out int payloadByteCount, out int correctedSymbols) { }
+        public static bool TryDecodeHeader(System.ReadOnlySpan<byte> headerWire, System.ReadOnlySpan<float> confidence, out M0LTE.Il2p.Il2pHeaderType headerType, out int payloadByteCount, out int correctedSymbols, out int erasedSymbols) { }
     }
     public readonly struct Il2pDecodeInfo : System.IEquatable<M0LTE.Il2p.Il2pDecodeInfo>
     {
-        public Il2pDecodeInfo(M0LTE.Il2p.Il2pHeaderType HeaderType, int CorrectedSymbols, bool? CrcValid) { }
+        public Il2pDecodeInfo(M0LTE.Il2p.Il2pHeaderType HeaderType, int CorrectedSymbols, bool? CrcValid, int ErasedSymbols = 0) { }
         public int CorrectedSymbols { get; init; }
         public bool? CrcValid { get; init; }
+        public int ErasedSymbols { get; init; }
         public M0LTE.Il2p.Il2pHeaderType HeaderType { get; init; }
     }
     public sealed class Il2pDeframer
@@ -38,6 +41,7 @@ namespace M0LTE.Il2p
         public long CrcFailures { get; }
         public long RsFailures { get; }
         public void PushBit(int bit) { }
+        public void PushBit(int bit, float confidence) { }
         public void Reset() { }
     }
     public static class Il2pFramer
