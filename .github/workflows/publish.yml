@@ -13,6 +13,14 @@ on:
   push:
     tags:
       - 'v*.*.*'
+  # Re-fire a release whose tag-push event GitHub dropped (it happens in outages): dispatch
+  # with the existing tag's name. The run checks out and verifies that tag's tree, so the
+  # published bits are identical to what the push event would have built.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing v<MAJOR>.<MINOR>.<PATCH> tag to publish'
+        required: true
 
 jobs:
   publish:
@@ -20,8 +28,12 @@ jobs:
     permissions:
       id-token: write   # mint the OIDC token for Trusted Publishing
       contents: write   # create the GitHub release
+    env:
+      RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref_name }}
 
       - name: Set up .NET (from global.json)
         uses: actions/setup-dotnet@v6
@@ -31,7 +43,7 @@ jobs:
       - name: Verify tag matches <Version>
         run: |
           set -euo pipefail
-          tag="${GITHUB_REF_NAME#v}"
+          tag="${RELEASE_TAG#v}"
           version="$(grep -oPm1 '(?<=<Version>)[^<]+' Directory.Build.props)"
           echo "tag=$tag  <Version>=$version"
           if [ "$tag" != "$version" ]; then
@@ -70,4 +82,4 @@ jobs:
       - name: Create GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" artifacts/*.nupkg --title "$GITHUB_REF_NAME" --generate-notes
+        run: gh release create "$RELEASE_TAG" artifacts/*.nupkg --title "$RELEASE_TAG" --generate-notes
