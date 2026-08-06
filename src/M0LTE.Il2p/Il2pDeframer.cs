@@ -39,7 +39,7 @@ public sealed class Il2pDeframer
     private readonly int _syncWord;
     private readonly Action<byte[], Il2pDecodeInfo> _frameReceived;
     private readonly byte[] _buffer;
-    private readonly float[] _bufferConfidence;
+    private readonly float[] _bufferBitConfidence;
     private readonly byte[] _ring = new byte[RingSize];
     private readonly float[] _confidenceRing = new float[RingSize];
 
@@ -54,7 +54,6 @@ public sealed class Il2pDeframer
     private long _readPos;
     private long _syncEndPos;
     private int _huntWarmup = 23;
-    private float _byteMinConfidence = float.MaxValue;
     private bool _confidenceSeen;
 
     /// <summary>Creates a deframer delivering decoded AX.25 frames to
@@ -82,7 +81,7 @@ public sealed class Il2pDeframer
         int maxBody = Il2pBlockLayout.Compute(Il2pCodec.MaxPayloadBytes).WireLength
             + Il2pCodec.TrailingCrcWireLength;
         _buffer = new byte[Il2pCodec.HeaderWireLength + maxBody];
-        _bufferConfidence = new float[_buffer.Length];
+        _bufferBitConfidence = new float[_buffer.Length * 8];
     }
 
     /// <summary>Frames that failed Reed-Solomon decoding after a sync match (diagnostics).</summary>
@@ -148,7 +147,6 @@ public sealed class Il2pDeframer
                 _byteShift = 0;
                 _bitCount = 0;
                 _length = 0;
-                _byteMinConfidence = float.MaxValue;
                 _syncEndPos = _readPos - 1; // the bit just consumed is the sync's last
             }
 
@@ -157,19 +155,13 @@ public sealed class Il2pDeframer
 
         bit ^= _invert;
         _byteShift = (_byteShift << 1) | bit; // MSB first
-        if (confidence < _byteMinConfidence)
-        {
-            _byteMinConfidence = confidence;
-        }
-
+        _bufferBitConfidence[(_length * 8) + _bitCount] = confidence;
         if (++_bitCount < 8)
         {
             return;
         }
 
         _bitCount = 0;
-        _bufferConfidence[_length] = _byteMinConfidence;
-        _byteMinConfidence = float.MaxValue;
         _buffer[_length++] = (byte)_byteShift;
         _byteShift = 0;
 
@@ -182,7 +174,8 @@ public sealed class Il2pDeframer
 
             if (!Il2pCodec.TryDecodeHeader(
                     _buffer.AsSpan(0, Il2pCodec.HeaderWireLength),
-                    _confidenceSeen ? _bufferConfidence.AsSpan(0, Il2pCodec.HeaderWireLength) : [],
+                    _confidenceSeen
+                        ? _bufferBitConfidence.AsSpan(0, Il2pCodec.HeaderWireLength * 8) : [],
                     out _, out int payloadByteCount, out _, out _))
             {
                 RsFailures++;
@@ -213,7 +206,7 @@ public sealed class Il2pDeframer
     {
         if (!Il2pCodec.TryDecode(
                 _buffer.AsSpan(0, _length), _crcMode,
-                _confidenceSeen ? _bufferConfidence.AsSpan(0, _length) : [],
+                _confidenceSeen ? _bufferBitConfidence.AsSpan(0, _length * 8) : [],
                 out byte[] frame, out var info))
         {
             RsFailures++;

@@ -149,6 +149,125 @@ public class Il2pErasureTests
         Run(withConfidence: true).Should().ContainSingle().Which.Should().Equal(ax25);
     }
 
+    [Fact]
+    public void One_Chased_Bit_Rescues_A_Block_One_Error_Past_The_Budget()
+    {
+        // Nine damaged bytes against an errors-only budget of eight - but one of them is a
+        // single flipped bit the receiver's confidence fingers exactly. Chase flips it back
+        // for free, the remaining eight fit the budget, and neither erasure spends a symbol.
+        byte[] ax25 = TestFrame();
+        byte[] wire = Il2pCodec.Encode(ax25, appendCrc: true);
+        var bitConfidence = new float[wire.Length * 8];
+        Array.Fill(bitConfidence, 1f);
+        var random = new Random(17);
+        for (int i = 0; i < 8; i++)
+        {
+            int position = Il2pCodec.HeaderWireLength + 3 + (i * 6);
+            wire[position] ^= (byte)random.Next(1, 256);   // deep damage, unflagged
+        }
+
+        int flippedBit = ((Il2pCodec.HeaderWireLength + 60) * 8) + 5;
+        wire[flippedBit / 8] ^= (byte)(0x80 >> (flippedBit % 8));
+        bitConfidence[flippedBit] = 0.05f;
+
+        Il2pCodec.TryDecode(wire, hasTrailingCrc: true, out _, out _)
+            .Should().BeFalse("nine errors exceed the errors-only budget");
+
+        Il2pCodec.TryDecode(wire, hasTrailingCrc: true, bitConfidence, out byte[] decoded, out var info)
+            .Should().BeTrue("one chased bit brings the block back inside the budget");
+        decoded.Should().Equal(ax25);
+        info.ChasedBits.Should().Be(1);
+        info.ErasedSymbols.Should().Be(0, "chase runs before erasures and cost no parity");
+        info.CorrectedSymbols.Should().Be(8);
+        info.CrcValid.Should().BeTrue();
+    }
+
+    [Fact]
+    public void Two_Chased_Bits_Rescue_A_Header_Erasures_Cannot_Touch()
+    {
+        // The 2-parity header corrects one unlocated error and gets no erasure ladder; two
+        // damaged bits are fatal unless the confidence fingers them for chase - which must
+        // then decode to an exact codeword, both parity symbols spent as pure check.
+        byte[] ax25 = TestFrame();
+        byte[] wire = Il2pCodec.Encode(ax25, appendCrc: true);
+        var bitConfidence = new float[wire.Length * 8];
+        Array.Fill(bitConfidence, 1f);
+        foreach (int bit in new[] { (3 * 8) + 2, (9 * 8) + 6 })
+        {
+            wire[bit / 8] ^= (byte)(0x80 >> (bit % 8));
+            bitConfidence[bit] = 0.1f;
+        }
+
+        Il2pCodec.TryDecode(wire, hasTrailingCrc: true, out _, out _)
+            .Should().BeFalse("two header errors exceed the header code");
+
+        Il2pCodec.TryDecode(wire, hasTrailingCrc: true, bitConfidence, out byte[] decoded, out var info)
+            .Should().BeTrue("both damaged bits are among the chased weakest");
+        decoded.Should().Equal(ax25);
+        info.ChasedBits.Should().Be(2);
+        info.CrcValid.Should().BeTrue();
+    }
+
+    [Fact]
+    public void Wrongly_Flagged_Bits_Do_Not_Hallucinate_A_Header()
+    {
+        // Confidence pointing at healthy bits must not conjure a decode: header chase
+        // accepts exact codewords only, so flipping healthy bits just fails 63 times.
+        byte[] ax25 = TestFrame();
+        byte[] wire = Il2pCodec.Encode(ax25, appendCrc: true);
+        var bitConfidence = new float[wire.Length * 8];
+        Array.Fill(bitConfidence, 1f);
+        wire[3] ^= 0x41;
+        wire[9] ^= 0x0F;   // multi-bit header damage, none of it flagged
+        for (int b = 0; b < 6; b++)
+        {
+            bitConfidence[(12 * 8) + b] = 0.1f;   // flags on a healthy byte instead
+        }
+
+        Il2pCodec.TryDecode(wire, hasTrailingCrc: true, bitConfidence, out _, out _)
+            .Should().BeFalse("chase cannot invent a header from wrong flags");
+    }
+
+    [Fact]
+    public void The_Deframer_Chases_Header_Bits_End_To_End()
+    {
+        byte[] ax25 = TestFrame();
+        byte[] wire = Il2pCodec.Encode(ax25, appendCrc: true);
+        var damaged = (byte[])wire.Clone();
+        int[] headerBits = [(2 * 8) + 4, (11 * 8) + 1];
+        foreach (int bit in headerBits)
+        {
+            damaged[bit / 8] ^= (byte)(0x80 >> (bit % 8));
+        }
+
+        List<byte[]> Run(bool withConfidence)
+        {
+            var received = new List<byte[]>();
+            var deframer = new Il2pDeframer((frame, _) => received.Add(frame), crcMode: true);
+            foreach (int bit in Sync())
+            {
+                deframer.PushBit(bit);
+            }
+
+            for (int i = 0; i < damaged.Length; i++)
+            {
+                for (int b = 0; b < 8; b++)
+                {
+                    int bitIndex = (i * 8) + b;
+                    int bit = (damaged[i] >> (7 - b)) & 1;
+                    float confidence =
+                        withConfidence && Array.IndexOf(headerBits, bitIndex) >= 0 ? 0.05f : 1f;
+                    deframer.PushBit(bit, confidence);
+                }
+            }
+
+            return received;
+        }
+
+        Run(withConfidence: false).Should().BeEmpty("two header bit errors are fatal unflagged");
+        Run(withConfidence: true).Should().ContainSingle().Which.Should().Equal(ax25);
+    }
+
     private static IEnumerable<int> Sync()
     {
         for (int i = 0; i < 24; i++)

@@ -16,8 +16,14 @@ namespace M0LTE.Il2p;
 /// confidence-aware path, and only when errors-only decoding had already failed. A frame
 /// recovered this way leaned on receiver confidence as well as parity; the count is the
 /// honest measure of how hard.</param>
+/// <param name="ChasedBits">Received bits the decode flipped outright on the caller's
+/// confidence hints - chase decoding, tried when errors-only decoding fails, before
+/// erasures. A correct flip costs no parity at all where an erasure costs one symbol and an
+/// unlocated error two, which is what rescues a block sitting one or two scattered bit
+/// errors past the budget - and it is the 2-parity header's only rescue.</param>
 public readonly record struct Il2pDecodeInfo(
-    Il2pHeaderType HeaderType, int CorrectedSymbols, bool? CrcValid, int ErasedSymbols = 0);
+    Il2pHeaderType HeaderType, int CorrectedSymbols, bool? CrcValid, int ErasedSymbols = 0,
+    int ChasedBits = 0);
 
 /// <summary>
 /// Whole-frame IL2P encoder/decoder (spec draft v0.6), covering both header types, the
@@ -187,10 +193,14 @@ public static class Il2pCodec
 
         Span<byte> block = stackalloc byte[HeaderWireLength];
         headerWire[..HeaderWireLength].CopyTo(block);
+        SplitConfidence(confidence, headerWire.Length,
+            out ReadOnlySpan<float> headerBytes, out ReadOnlySpan<float> headerBits);
         int corrected = DecodeBlock(
             HeaderRs, block, headerWire[..HeaderWireLength],
-            confidence.IsEmpty ? [] : confidence[..HeaderWireLength], HeaderErasureLadder,
-            out int erased);
+            headerBytes.IsEmpty ? [] : headerBytes[..HeaderWireLength],
+            headerBits.IsEmpty ? [] : headerBits[..(HeaderWireLength * 8)],
+            HeaderErasureLadder, HeaderChaseBits, HeaderChaseErrorCap,
+            out int erased, out _);
         if (corrected < 0)
         {
             return false;
@@ -247,17 +257,24 @@ public static class Il2pCodec
         info = default;
 
         if (il2pWire.Length < HeaderWireLength
-            || (!byteConfidence.IsEmpty && byteConfidence.Length != il2pWire.Length))
+            || (!byteConfidence.IsEmpty
+                && byteConfidence.Length != il2pWire.Length
+                && byteConfidence.Length != il2pWire.Length * 8))
         {
             return false;
         }
+
+        SplitConfidence(byteConfidence, il2pWire.Length,
+            out ReadOnlySpan<float> bytesConf, out ReadOnlySpan<float> bitsConf);
 
         Span<byte> headerBlock = stackalloc byte[HeaderWireLength];
         il2pWire[..HeaderWireLength].CopyTo(headerBlock);
         int corrected = DecodeBlock(
             HeaderRs, headerBlock, il2pWire[..HeaderWireLength],
-            byteConfidence.IsEmpty ? [] : byteConfidence[..HeaderWireLength],
-            HeaderErasureLadder, out int erased);
+            bytesConf.IsEmpty ? [] : bytesConf[..HeaderWireLength],
+            bitsConf.IsEmpty ? [] : bitsConf[..(HeaderWireLength * 8)],
+            HeaderErasureLadder, HeaderChaseBits, HeaderChaseErrorCap,
+            out int erased, out int chased);
         if (corrected < 0)
         {
             return false;
@@ -288,8 +305,10 @@ public static class Il2pCodec
             il2pWire.Slice(inPos, wireSize).CopyTo(codeword);
             int blockCorrected = DecodeBlock(
                 PayloadRs, codeword, il2pWire.Slice(inPos, wireSize),
-                byteConfidence.IsEmpty ? [] : byteConfidence.Slice(inPos, wireSize),
-                PayloadErasureLadder, out int blockErased);
+                bytesConf.IsEmpty ? [] : bytesConf.Slice(inPos, wireSize),
+                bitsConf.IsEmpty ? [] : bitsConf.Slice(inPos * 8, wireSize * 8),
+                PayloadErasureLadder, PayloadChaseBits, PayloadChaseErrorCap,
+                out int blockErased, out int blockChased);
             if (blockCorrected < 0)
             {
                 return false;
@@ -297,6 +316,7 @@ public static class Il2pCodec
 
             corrected += blockCorrected;
             erased += blockErased;
+            chased += blockChased;
             Il2pScrambler.Descramble(codeword[..size]);
             codeword[..size].CopyTo(payload.AsSpan(outPos));
             inPos += wireSize;
@@ -337,8 +357,61 @@ public static class Il2pCodec
             crcValid = received == Crc16X25.Compute(ax25Frame);
         }
 
-        info = new Il2pDecodeInfo(headerType, corrected, crcValid, erased);
+        info = new Il2pDecodeInfo(headerType, corrected, crcValid, erased, chased);
         return true;
+    }
+
+    /// <summary>
+    /// The caller's confidence span is either per-byte (length n, erasures only) or per-bit
+    /// (length 8n, erasures and chase); a per-bit span also yields the per-byte view, each
+    /// byte's confidence being the minimum of its bits' - a byte is wrong if any bit is.
+    /// The derived per-byte values live in a rented-free heap array only on the bit path,
+    /// which only runs when a block already failed.
+    /// </summary>
+    private static void SplitConfidence(
+        ReadOnlySpan<float> confidence, int wireLength,
+        out ReadOnlySpan<float> bytes, out ReadOnlySpan<float> bits)
+    {
+        if (confidence.IsEmpty)
+        {
+            bytes = [];
+            bits = [];
+            return;
+        }
+
+        if (confidence.Length == wireLength)
+        {
+            bytes = confidence;
+            bits = [];
+            return;
+        }
+
+        if (confidence.Length != wireLength * 8)
+        {
+            // A mismatched span is a caller bug; decode hard rather than misindex.
+            bytes = [];
+            bits = [];
+            return;
+        }
+
+        var byteMins = new float[wireLength];
+        for (int i = 0; i < wireLength; i++)
+        {
+            float min = float.MaxValue;
+            for (int b = 0; b < 8; b++)
+            {
+                float c = confidence[(i * 8) + b];
+                if (c < min)
+                {
+                    min = c;
+                }
+            }
+
+            byteMins[i] = min;
+        }
+
+        bytes = byteMins;
+        bits = confidence;
     }
 
     /// <summary>
@@ -357,28 +430,114 @@ public static class Il2pCodec
     /// <summary>
     /// The header's 2-parity code affords no speculative erasures at all: any rung would
     /// spend both parity symbols and accept whatever interpolation produced - a hallucinated
-    /// header that sizes a bogus collection. Erasure rescue is a payload-block tool; a
-    /// damaged header's remaining hope is bit-level chase decoding arbitrated by the
-    /// trailing CRC, which is future work (pdn-soundmodem docs/rx-roadmap.md workstream 1).
+    /// header that sizes a bogus collection. The header's rescue is chase, below.
     /// </summary>
     private static readonly (int Erasures, int MaxErrors)[] HeaderErasureLadder = [];
 
+    /// <summary>Weakest bits chased in a failed payload block: 31 flip patterns. Chase runs
+    /// before the erasure ladder because a correct flip costs no parity at all - it is what
+    /// rescues a block one or two scattered bit errors past the budget, the AWGN-knee
+    /// pattern erasures cannot reach.</summary>
+    private const int PayloadChaseBits = 5;
+
+    /// <summary>Payload chase candidates decode with the code's full error budget: each
+    /// attempt carries exactly a plain errors-only decode's bounded-distance guarantee, and
+    /// the ~31x multiplier is why this is <b>CRC-arbitrated</b> chase - on an IL2P+CRC link
+    /// the trailing CRC judges the frame, and a plain-only reading reaches a host only
+    /// through the corroboration and acceptPlainIl2p gates that already price RS-only
+    /// evidence.</summary>
+    private const int PayloadChaseErrorCap = -1;
+
+    /// <summary>Weakest bits chased in a failed header: 63 flip patterns.</summary>
+    private const int HeaderChaseBits = 6;
+
+    /// <summary>Header chase candidates must decode to an <em>exact</em> codeword (zero
+    /// located errors), keeping both parity symbols as pure check - a 2-parity decode that
+    /// spent one on an error would have no margin left, and 63 attempts at no margin would
+    /// hallucinate headers that size bogus collections.</summary>
+    private const int HeaderChaseErrorCap = 0;
+
     /// <summary>
-    /// Decodes one Reed-Solomon block: errors-only first and, when that fails and the
-    /// caller supplied confidence, retrying from <paramref name="original"/> with the
-    /// weakest bytes erased, down the <paramref name="ladder"/>. <paramref name="working"/>
-    /// holds the decoded block on success.
+    /// Decodes one Reed-Solomon block: errors-only first; when that fails and the caller
+    /// supplied per-bit confidence, chase - retry from <paramref name="original"/> with the
+    /// weakest bits flipped, patterns in ascending flip count; when that fails too and
+    /// per-byte confidence exists, the erasure ladder. <paramref name="working"/> holds the
+    /// decoded block on success.
     /// </summary>
     /// <returns>Corrected byte count, or -1 when every attempt fails.</returns>
     private static int DecodeBlock(
         ReedSolomon rs, Span<byte> working, ReadOnlySpan<byte> original,
-        ReadOnlySpan<float> confidence, (int Erasures, int MaxErrors)[] ladder, out int erased)
+        ReadOnlySpan<float> confidence, ReadOnlySpan<float> bitConfidence,
+        (int Erasures, int MaxErrors)[] ladder, int chaseBits, int chaseErrorCap,
+        out int erased, out int chased)
     {
         erased = 0;
+        chased = 0;
         int corrected = rs.Decode(working);
-        if (corrected >= 0 || confidence.IsEmpty)
+        if (corrected >= 0 || (confidence.IsEmpty && bitConfidence.IsEmpty))
         {
             return corrected;
+        }
+
+        if (!bitConfidence.IsEmpty && chaseBits > 0)
+        {
+            // The chaseBits weakest bit positions, weakest first (partial selection sort -
+            // salvage path, not a hot one).
+            Span<int> weakBits = stackalloc int[chaseBits];
+            int totalBits = original.Length * 8;
+            for (int k = 0; k < chaseBits; k++)
+            {
+                int best = -1;
+                for (int i = 0; i < totalBits; i++)
+                {
+                    if (weakBits[..k].Contains(i))
+                    {
+                        continue;
+                    }
+
+                    if (best < 0 || bitConfidence[i] < bitConfidence[best])
+                    {
+                        best = i;
+                    }
+                }
+
+                weakBits[k] = best;
+            }
+
+            // Flip patterns in ascending flip count: one wrong bit is likelier than three.
+            for (int flips = 1; flips <= chaseBits; flips++)
+            {
+                for (int mask = 1; mask < (1 << chaseBits); mask++)
+                {
+                    if (System.Numerics.BitOperations.PopCount((uint)mask) != flips)
+                    {
+                        continue;
+                    }
+
+                    original.CopyTo(working);
+                    for (int k = 0; k < chaseBits; k++)
+                    {
+                        if ((mask & (1 << k)) != 0)
+                        {
+                            int bit = weakBits[k];
+                            working[bit / 8] ^= (byte)(0x80 >> (bit % 8));
+                        }
+                    }
+
+                    corrected = rs.Decode(working, [], chaseErrorCap);
+                    if (corrected >= 0)
+                    {
+                        chased = flips;
+                        return corrected;
+                    }
+                }
+            }
+        }
+
+        if (confidence.IsEmpty)
+        {
+            original.CopyTo(working);
+            return -1;
         }
 
         Span<int> weakest = stackalloc int[Il2pBlockLayout.ParitySymbolsPerBlock];

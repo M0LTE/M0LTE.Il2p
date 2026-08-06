@@ -28,7 +28,8 @@ namespace M0LTE.Il2p
     }
     public readonly struct Il2pDecodeInfo : System.IEquatable<M0LTE.Il2p.Il2pDecodeInfo>
     {
-        public Il2pDecodeInfo(M0LTE.Il2p.Il2pHeaderType HeaderType, int CorrectedSymbols, bool? CrcValid, int ErasedSymbols = 0) { }
+        public Il2pDecodeInfo(M0LTE.Il2p.Il2pHeaderType HeaderType, int CorrectedSymbols, bool? CrcValid, int ErasedSymbols = 0, int ChasedBits = 0) { }
+        public int ChasedBits { get; init; }
         public int CorrectedSymbols { get; init; }
         public bool? CrcValid { get; init; }
         public int ErasedSymbols { get; init; }
